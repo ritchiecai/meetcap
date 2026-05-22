@@ -207,17 +207,25 @@ class ProcessScreen(Screen):
                         detail="skipped",
                     )
 
-            # memory check before LLM
-            if not self._check_memory("llm", llm_model):
-                return
+            # memory check before LLM (skip for oMLX — it manages its own memory)
+            llm_backend = config.get("llm", "backend", "mlx-lm")  # type: ignore[union-attr]
+            if llm_backend != "omlx":
+                if not self._check_memory("llm", llm_model):
+                    return
 
             # stage 3: summarization
             self.app.call_from_thread(self._update_stage, "summarization", "active")
             model_short = llm_model.split("/")[-1]
-            self.app.call_from_thread(self._log, f"Summarizing with {model_short}...")
+            backend_label = "oMLX" if llm_backend == "omlx" else "mlx-lm"
+            self.app.call_from_thread(
+                self._log, f"Summarizing with {model_short} via {backend_label}..."
+            )
             sum_start = time.time()
             summary = self._run_summarization(transcript_text, config)
             sum_time = time.time() - sum_start
+            self.app.call_from_thread(
+                self._log, f"Summary generated in {sum_time:.1f}s ({backend_label})"
+            )
             self.app.call_from_thread(self._update_stage, "summarization", "done", timing=sum_time)
 
             # stage 4: organize
@@ -420,6 +428,13 @@ class ProcessScreen(Screen):
         max_tokens = int(
             config.get("llm", "max_tokens", 4096)  # type: ignore[union-attr]
         )
+        enable_thinking = bool(
+            config.get("llm", "enable_thinking", False)  # type: ignore[union-attr]
+        )
+        thinking_budget = int(
+            config.get("llm", "thinking_budget", 512)  # type: ignore[union-attr]
+        )
+        llm_backend = config.get("llm", "backend", "mlx-lm")  # type: ignore[union-attr]
 
         try:
             # write transcript to temp file (avoid shell escaping issues)
@@ -429,9 +444,34 @@ class ProcessScreen(Screen):
                 f.write(transcript)
                 transcript_path = f.name
 
-            # run summarization in isolated subprocess to avoid
-            # "bad value(s) in fds_to_keep" error from mlx-vlm inside textual
-            script = f"""
+            if llm_backend == "omlx":
+                # oMLX: call via OpenAI-compatible API (no fd issues)
+                omlx_url = config.get("llm", "omlx_base_url", "http://localhost:8000/v1")  # type: ignore[union-attr]
+                omlx_key = config.get("llm", "omlx_api_key", "")  # type: ignore[union-attr]
+                omlx_timeout = int(config.get("llm", "omlx_timeout", 300))  # type: ignore[union-attr]
+
+                script = f"""
+import json, sys
+from meetcap.services.summarization import OmlxSummarizationService
+with open({transcript_path!r}, encoding="utf-8") as f:
+    transcript = f.read()
+service = OmlxSummarizationService(
+    model_name={model_name!r},
+    base_url={omlx_url!r},
+    temperature={temperature},
+    max_tokens={max_tokens},
+    enable_thinking={enable_thinking},
+    thinking_budget={thinking_budget},
+    api_key={omlx_key!r},
+    timeout={omlx_timeout},
+)
+result = service.summarize(transcript)
+print(json.dumps({{"summary": result}}))
+"""
+            else:
+                # mlx-lm: run in isolated subprocess to avoid
+                # "bad value(s) in fds_to_keep" error from mlx-vlm inside textual
+                script = f"""
 import json, sys
 from meetcap.services.summarization import SummarizationService
 with open({transcript_path!r}, encoding="utf-8") as f:
@@ -440,6 +480,8 @@ service = SummarizationService(
     model_name={model_name!r},
     temperature={temperature},
     max_tokens={max_tokens},
+    enable_thinking={enable_thinking},
+    thinking_budget={thinking_budget},
 )
 service.load_model()
 result = service.summarize(transcript)
@@ -450,7 +492,7 @@ print(json.dumps({{"summary": result}}))
                 [sys.executable, "-c", script],
                 capture_output=True,
                 text=True,
-                timeout=300,
+                timeout=600 if llm_backend == "omlx" else 300,
             )
 
             # clean up temp file
