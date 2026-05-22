@@ -222,6 +222,50 @@ def _clean_thinking_tags(text: str) -> str:
     return cleaned.strip()
 
 
+def _strip_untagged_thinking(text: str) -> str:
+    """
+    remove untagged thinking content that some models emit without <think> tags.
+
+    detects patterns like "Thinking Process:" or "Thinking:" at the start of output
+    followed by the actual summary content starting with a markdown heading (# or ##).
+
+    args:
+        text: output text possibly containing untagged thinking
+
+    returns:
+        cleaned text with only the actual summary content
+    """
+    # pattern: text starts with thinking-like header, actual content starts at first markdown heading
+    thinking_prefixes = (
+        "thinking process:",
+        "thinking:",
+        "my thinking:",
+        "internal reasoning:",
+        "reasoning:",
+        "let me think",
+        "i need to",
+        "1.  **analyze",
+        "1. **analyze",
+    )
+
+    text_lower = text.lower().lstrip()
+    if any(text_lower.startswith(prefix) for prefix in thinking_prefixes):
+        # find the first markdown heading that looks like actual summary content
+        # look for ## Meeting Title, ## Summary, # Meeting, etc.
+        match = re.search(r"^(#{1,2}\s+(?:meeting|summary|key|participants|decisions|action|notable))", text, re.MULTILINE | re.IGNORECASE)
+        if match:
+            return text[match.start():].strip()
+
+    # also handle case where thinking appears as numbered analysis before actual content
+    # e.g., "1. **Analyze the Request:**\n..." followed by actual markdown
+    if text_lower.startswith("1.") and "**" in text[:50]:
+        match = re.search(r"^(#{1,2}\s+(?:meeting|summary|key|participants|decisions|action|notable))", text, re.MULTILINE | re.IGNORECASE)
+        if match:
+            return text[match.start():].strip()
+
+    return text
+
+
 # ---------------------------------------------------------------------------
 # OmlxSummarizationService — calls local oMLX server via OpenAI-compatible API
 # ---------------------------------------------------------------------------
@@ -410,7 +454,12 @@ class OmlxSummarizationService:
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "stream": False,
+            "chat_template_kwargs": {"enable_thinking": self.enable_thinking},
         }
+
+        # if thinking is enabled, pass thinking_budget
+        if self.enable_thinking:
+            payload["chat_template_kwargs"]["thinking_budget"] = self.thinking_budget
 
         data = _json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
@@ -438,10 +487,13 @@ class OmlxSummarizationService:
 
         raw_output = result["choices"][0]["message"]["content"].strip()
 
-        # clean thinking tags if present
-        if self.enable_thinking and ("<think" in raw_output.lower() or "</think" in raw_output.lower()):
+        # always clean thinking tags — models may output them regardless of enable_thinking
+        if "<think" in raw_output.lower() or "</think" in raw_output.lower():
             console.print("[dim]detected thinking tags in output, cleaning...[/dim]")
             raw_output = _clean_thinking_tags(raw_output)
+
+        # handle untagged thinking content (e.g., "Thinking Process:" prefix)
+        raw_output = _strip_untagged_thinking(raw_output)
 
         # warn if output seems empty
         if not raw_output or len(raw_output) < 10:
@@ -688,11 +740,13 @@ class SummarizationService:
 
         raw_output = raw_output.strip()
 
-        # clean thinking tags if present (safety net for when thinking is enabled)
-        if self.enable_thinking:
-            if "<think" in raw_output.lower() or "</think" in raw_output.lower():
-                console.print("[dim]detected thinking tags in output, cleaning...[/dim]")
+        # always clean thinking tags — models may output them regardless of enable_thinking
+        if "<think" in raw_output.lower() or "</think" in raw_output.lower():
+            console.print("[dim]detected thinking tags in output, cleaning...[/dim]")
             raw_output = _clean_thinking_tags(raw_output)
+
+        # handle untagged thinking content
+        raw_output = _strip_untagged_thinking(raw_output)
 
         # warn if output seems empty after cleaning
         if not raw_output or len(raw_output) < 10:
