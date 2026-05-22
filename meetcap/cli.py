@@ -36,7 +36,12 @@ from meetcap.services.model_download import (
     verify_vosk_model,
     verify_whisper_model,
 )
-from meetcap.services.summarization import SummarizationService, extract_meeting_title, save_summary
+from meetcap.services.summarization import (
+    OmlxSummarizationService,
+    SummarizationService,
+    extract_meeting_title,
+    save_summary,
+)
 from meetcap.services.transcription import (
     FasterWhisperService,
     MlxWhisperService,
@@ -873,12 +878,6 @@ class RecordingOrchestrator:
         """
         console.print("\n[bold]🤖 summarization[/bold]")
 
-        # check memory pressure before loading LLM model
-        if self.config.get("memory", "auto_fallback", True):
-            threshold = self.config.get("memory", "warning_threshold", 80)
-            # ensure threshold is a float
-            check_memory_pressure(float(threshold))
-
         # use provided model name or default from config
         if not llm_model:
             llm_model = self.config.get(
@@ -886,23 +885,48 @@ class RecordingOrchestrator:
             )
 
         llm_config = self.config.get_section("llm")
+        llm_backend = llm_config.get("backend", "mlx-lm")
 
-        llm_service = SummarizationService(
-            model_name=llm_model,
-            temperature=llm_config.get("temperature", 0.4),
-            max_tokens=llm_config.get("max_tokens", 4096),
-            enable_thinking=llm_config.get("enable_thinking", False),
-            thinking_budget=llm_config.get("thinking_budget", 512),
-        )
+        if llm_backend == "omlx":
+            # use oMLX server for summarization (no in-process model loading)
+            # skip memory pressure checks — oMLX manages its own memory
+            omlx_url = llm_config.get("omlx_base_url", "http://localhost:8000/v1")
+            omlx_key = llm_config.get("omlx_api_key", "")
+            omlx_timeout = llm_config.get("omlx_timeout", 300)
+
+            llm_service = OmlxSummarizationService(
+                model_name=llm_model,
+                base_url=omlx_url,
+                temperature=llm_config.get("temperature", 0.4),
+                max_tokens=llm_config.get("max_tokens", 4096),
+                enable_thinking=llm_config.get("enable_thinking", False),
+                thinking_budget=llm_config.get("thinking_budget", 512),
+                api_key=omlx_key,
+                timeout=int(omlx_timeout),
+            )
+        else:
+            # use in-process mlx-lm / mlx-vlm — check memory pressure first
+            if self.config.get("memory", "auto_fallback", True):
+                threshold = self.config.get("memory", "warning_threshold", 80)
+                check_memory_pressure(float(threshold))
+
+            llm_service = SummarizationService(
+                model_name=llm_model,
+                temperature=llm_config.get("temperature", 0.4),
+                max_tokens=llm_config.get("max_tokens", 4096),
+                enable_thinking=llm_config.get("enable_thinking", False),
+                thinking_budget=llm_config.get("thinking_budget", 512),
+            )
 
         try:
-            # check memory before loading LLM model
-            sufficient, avail, needed, msg = check_memory_for_model("llm", llm_model)
-            if not sufficient:
-                console.print(f"[red]{msg}[/red]")
-                return None
-            elif msg:
-                console.print(f"[yellow]{msg}[/yellow]")
+            # check memory before loading LLM model (skip for oMLX — it manages its own memory)
+            if llm_backend != "omlx":
+                sufficient, avail, needed, msg = check_memory_for_model("llm", llm_model)
+                if not sufficient:
+                    console.print(f"[red]{msg}[/red]")
+                    return None
+                elif msg:
+                    console.print(f"[yellow]{msg}[/yellow]")
 
             # explicitly load model if supported
             if hasattr(llm_service, "load_model"):

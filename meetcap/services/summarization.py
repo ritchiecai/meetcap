@@ -1,8 +1,11 @@
-"""llm-based meeting summarization using qwen3.5 via mlx-vlm"""
+"""llm-based meeting summarization using qwen3.5 via mlx-lm, mlx-vlm, or omlx server"""
 
+import json as _json
 import re
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from rich.console import Console
@@ -13,6 +16,443 @@ console = Console()
 # fixed chunking constants (chars, not tokens)
 CHUNK_THRESHOLD = 500_000
 CHUNK_SIZE = 400_000
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers (used by both SummarizationService and OmlxSummarizationService)
+# ---------------------------------------------------------------------------
+
+
+def _build_system_prompt(has_speaker_info: bool) -> str:
+    """build the system prompt for meeting summarization."""
+    if has_speaker_info:
+        return (
+            "you are a world-class executive assistant who creates comprehensive, actionable meeting summaries. "
+            "the transcript includes speaker labels (e.g., [Speaker 1], [Speaker 2]). "
+            "analyze the transcript and produce detailed notes with these exact sections:\n\n"
+            "## Meeting Title\n"
+            "generate a concise title (2-4 words) that captures the main topic of the meeting.\n"
+            "the title should be in PascalCase with no spaces (e.g., 'ProductRoadmap', 'TeamRetrospective').\n"
+            "write only the title on a single line, nothing else in this section.\n\n"
+            "## Summary\n"
+            "provide a comprehensive 3-5 paragraph summary covering:\n"
+            "- main topics discussed and context\n"
+            "- key points raised by specific speakers\n"
+            "- important details, data, or examples mentioned\n"
+            "- overall meeting outcome and next steps\n\n"
+            "## Participants\n"
+            "list the speakers identified in the transcript:\n"
+            "- note their key contributions or roles in the discussion\n"
+            "- identify who led the meeting if apparent\n\n"
+            "## Key Discussion Points\n"
+            "list 5-10 bullet points of the most important topics discussed:\n"
+            "- include specific details and context for each point\n"
+            "- attribute key points to specific speakers when relevant\n"
+            "- note any disagreements or alternative viewpoints between speakers\n"
+            "- highlight critical information or insights shared\n\n"
+            "## Decisions Made\n"
+            "list all decisions made during the meeting:\n"
+            "- be specific about what was decided\n"
+            "- include rationale if discussed\n"
+            "- note which speaker made or supported the decision\n"
+            "- if no decisions were made, write 'no formal decisions made'\n\n"
+            "## Action Items\n"
+            "list all tasks and follow-ups mentioned:\n"
+            "- format: - [ ] owner (Speaker X) — detailed task description (due: yyyy-mm-dd)\n"
+            "- if no owner mentioned, use 'tbd' as owner\n"
+            "- if no date mentioned, use 'tbd' for date\n"
+            "- include context for why each action is needed\n"
+            "- if no action items, write 'no action items identified'\n\n"
+            "## Notable Quotes\n"
+            "include 2-3 important verbatim quotes with speaker attribution\n\n"
+            "## Meeting Tone\n"
+            "briefly describe the overall tone and energy of the meeting.\n\n"
+            "IMPORTANT GUIDELINES:\n"
+            "- DO NOT attempt to identify or include the actual names of meeting participants. "
+            "The transcription system is unreliable with names, so refer to speakers only by their labels (e.g., 'Speaker 1', 'Speaker 2').\n"
+            "- DO NOT expand acronyms or assume what they mean. Write acronyms exactly as spoken (e.g., write 'API' not 'Application Programming Interface'). "
+            "The summarization process tends to make errors when expanding abbreviations.\n\n"
+            "be thorough and detailed while maintaining clarity. "
+            "do not include any thinking tags or meta-commentary."
+        )
+    else:
+        return (
+            "you are a world-class executive assistant who creates comprehensive, actionable meeting summaries. "
+            "analyze the transcript and produce detailed notes with these exact sections:\n\n"
+            "## Meeting Title\n"
+            "generate a concise title (2-4 words) that captures the main topic of the meeting.\n"
+            "the title should be in PascalCase with no spaces (e.g., 'ProductRoadmap', 'TeamRetrospective').\n"
+            "write only the title on a single line, nothing else in this section.\n\n"
+            "## Summary\n"
+            "provide a comprehensive 3-5 paragraph summary covering:\n"
+            "- main topics discussed and context\n"
+            "- key points raised by participants\n"
+            "- important details, data, or examples mentioned\n"
+            "- overall meeting outcome and next steps\n\n"
+            "## Participants\n"
+            "list any participants mentioned or implied in the transcript.\n\n"
+            "## Key Discussion Points\n"
+            "list 5-10 bullet points of the most important topics discussed:\n"
+            "- include specific details and context for each point\n"
+            "- note any disagreements or alternative viewpoints\n"
+            "- highlight critical information or insights shared\n\n"
+            "## Decisions Made\n"
+            "list all decisions made during the meeting:\n"
+            "- be specific about what was decided\n"
+            "- include rationale if discussed\n"
+            "- note who made or supported the decision\n"
+            "- if no decisions were made, write 'no formal decisions made'\n\n"
+            "## Action Items\n"
+            "list all tasks and follow-ups mentioned:\n"
+            "- format: - [ ] owner — detailed task description (due: yyyy-mm-dd)\n"
+            "- if no owner mentioned, use 'tbd' as owner\n"
+            "- if no date mentioned, use 'tbd' for date\n"
+            "- include context for why each action is needed\n"
+            "- if no action items, write 'no action items identified'\n\n"
+            "## Notable Quotes\n"
+            "include 2-3 important verbatim quotes that capture key insights or decisions\n\n"
+            "## Meeting Tone\n"
+            "briefly describe the overall tone and energy of the meeting.\n\n"
+            "IMPORTANT GUIDELINES:\n"
+            "- DO NOT attempt to identify or include the actual names of meeting participants. "
+            "The transcription system is unreliable with names, so refer to participants generically (e.g., 'one participant mentioned', 'a team member noted').\n"
+            "- DO NOT expand acronyms or assume what they mean. Write acronyms exactly as spoken (e.g., write 'API' not 'Application Programming Interface'). "
+            "The summarization process tends to make errors when expanding abbreviations.\n\n"
+            "be thorough and detailed while maintaining clarity. "
+            "do not include any thinking tags or meta-commentary."
+        )
+
+
+def _build_user_prompt(
+    transcript_text: str,
+    meeting_title: str | None = None,
+    attendees: list[str] | None = None,
+    manual_notes_path: Path | None = None,
+) -> str:
+    """build the user prompt including transcript and optional context."""
+    user_prompt_parts = []
+
+    if meeting_title:
+        user_prompt_parts.append(f"meeting: {meeting_title}")
+    if attendees:
+        user_prompt_parts.append(f"attendees: {', '.join(attendees)}")
+
+    # add manual notes if available
+    if manual_notes_path and manual_notes_path.exists():
+        try:
+            with open(manual_notes_path, encoding="utf-8") as f:
+                manual_notes_text = f.read()
+            if manual_notes_text.strip():
+                console.print("[dim]manual notes found, including in summary[/dim]")
+                user_prompt_parts.append(f"manual notes:\n{manual_notes_text}")
+        except Exception as e:
+            console.print(f"[yellow]⚠[/yellow] could not read manual notes: {e}")
+
+    user_prompt_parts.append(f"transcript:\n{transcript_text}")
+    return "\n\n".join(user_prompt_parts)
+
+
+def _chunk_transcript(text: str, chunk_size: int = CHUNK_SIZE) -> list[str]:
+    """
+    split transcript into chunks for processing.
+
+    args:
+        text: full transcript text
+        chunk_size: approximate size of each chunk in chars
+
+    returns:
+        list of text chunks
+    """
+    chunks: list[str] = []
+    words = text.split()
+    current_chunk: list[str] = []
+    current_size = 0
+
+    for word in words:
+        word_len = len(word) + 1  # +1 for space
+        if current_size + word_len > chunk_size and current_chunk:
+            chunks.append(" ".join(current_chunk))
+            current_chunk = [word]
+            current_size = word_len
+        else:
+            current_chunk.append(word)
+            current_size += word_len
+
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+
+    return chunks
+
+
+def _clean_thinking_tags(text: str) -> str:
+    """
+    remove thinking tags from llm output.
+
+    qwen3-thinking models include <think>...</think> tags that should be removed.
+    handles edge cases like malformed tags, missing opening tags, etc.
+
+    args:
+        text: raw llm output possibly containing thinking tags
+
+    returns:
+        cleaned text without thinking tags
+    """
+    # handle case where content appears before </think> without opening tag
+    if "</think>" in text.lower() and "<think" not in text.lower():
+        pattern = r"(?is)^.*?</think\s*>"
+        cleaned = re.sub(pattern, "", text)
+    else:
+        cleaned = re.sub(r"(?is)<think[^>]*?>.*?</think\s*>", "", text)
+
+    # also handle <thinking>...</thinking> variant
+    if "</thinking>" in cleaned.lower() and "<thinking" not in cleaned.lower():
+        pattern = r"(?is)^.*?</thinking\s*>"
+        cleaned = re.sub(pattern, "", cleaned)
+    else:
+        cleaned = re.sub(r"(?is)<thinking[^>]*?>.*?</thinking\s*>", "", cleaned)
+
+    # remove any remaining lone tags (opening or closing)
+    cleaned = re.sub(r"(?i)</?think[^>]*?>", "", cleaned)
+    cleaned = re.sub(r"(?i)</?thinking[^>]*?>", "", cleaned)
+
+    # clean up any extra whitespace that may be left
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)  # collapse multiple newlines
+    cleaned = re.sub(r"^\n+", "", cleaned)  # remove leading newlines
+
+    return cleaned.strip()
+
+
+# ---------------------------------------------------------------------------
+# OmlxSummarizationService — calls local oMLX server via OpenAI-compatible API
+# ---------------------------------------------------------------------------
+
+
+class OmlxSummarizationService:
+    """generate meeting summaries via local oMLX server (OpenAI-compatible API).
+
+    oMLX (https://github.com/jundot/omlx) provides continuous batching, tiered
+    KV caching (RAM + SSD), and multi-model serving on Apple Silicon. This service
+    offloads LLM inference to the running oMLX server, freeing meetcap's process
+    memory for STT and diarization workloads.
+
+    requirements:
+        - oMLX running locally (brew services start omlx, or omlx serve)
+        - target model loaded in oMLX (auto-managed via LRU)
+    """
+
+    def __init__(
+        self,
+        model_name: str = "mlx-community/Qwen3.5-2B-OptiQ-4bit",
+        base_url: str = "http://localhost:8000/v1",
+        temperature: float = 0.4,
+        max_tokens: int = 4096,
+        enable_thinking: bool = False,
+        thinking_budget: int = 512,
+        api_key: str = "",
+        timeout: int = 300,
+    ):
+        """
+        initialize omlx summarization service.
+
+        args:
+            model_name: model name as known to oMLX (HuggingFace repo id or local name)
+            base_url: oMLX API base URL (default: http://localhost:8000/v1)
+            temperature: sampling temperature (0.2-0.6 recommended)
+            max_tokens: max tokens to generate
+            enable_thinking: enable thinking mode for the model
+            thinking_budget: max tokens for thinking block (when enabled)
+            api_key: API key for oMLX (empty string if no auth configured)
+            timeout: HTTP request timeout in seconds (default: 300s for long transcripts)
+        """
+        self.model_name = model_name
+        self.base_url = base_url.rstrip("/")
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.enable_thinking = enable_thinking
+        self.thinking_budget = thinking_budget
+        self.api_key = api_key
+        self.timeout = timeout
+
+    def load_model(self) -> None:
+        """no-op: oMLX manages model loading automatically."""
+        pass
+
+    def unload_model(self) -> None:
+        """no-op: oMLX manages model lifecycle via LRU eviction."""
+        console.print("[dim]omlx manages model lifecycle externally[/dim]")
+
+    def is_loaded(self) -> bool:
+        """check if oMLX server is reachable and model is available."""
+        try:
+            req = urllib.request.Request(f"{self.base_url}/models")
+            if self.api_key:
+                req.add_header("Authorization", f"Bearer {self.api_key}")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status == 200:
+                    data = _json.loads(resp.read().decode("utf-8"))
+                    models = [m.get("id", "") for m in data.get("data", [])]
+                    # check if our model (or a matching suffix) is available
+                    model_short = self.model_name.split("/")[-1] if "/" in self.model_name else self.model_name
+                    return any(model_short in m or self.model_name in m for m in models)
+            return False
+        except Exception:
+            return False
+
+    def summarize(
+        self,
+        transcript_text: str,
+        meeting_title: str | None = None,
+        attendees: list[str] | None = None,
+        has_speaker_info: bool = False,
+        manual_notes_path: Path | None = None,
+    ) -> str:
+        """
+        generate meeting summary from transcript via oMLX.
+
+        args:
+            transcript_text: full transcript text
+            meeting_title: optional meeting title
+            attendees: optional list of attendees
+            has_speaker_info: whether transcript includes speaker labels
+            manual_notes_path: optional path to user's manual notes file
+
+        returns:
+            markdown-formatted summary
+        """
+        # verify server is reachable
+        if not self._check_server():
+            raise ConnectionError(
+                f"oMLX server not reachable at {self.base_url}. "
+                "start it with: brew services start omlx  (or: omlx serve)"
+            )
+
+        console.print(f"[cyan]generating meeting summary via oMLX ({self.model_name})...[/cyan]")
+        start_time = time.time()
+
+        system_prompt = _build_system_prompt(has_speaker_info)
+        user_prompt = _build_user_prompt(
+            transcript_text, meeting_title, attendees, manual_notes_path
+        )
+
+        # chunk if needed
+        if len(user_prompt) > CHUNK_THRESHOLD:
+            chunks = _chunk_transcript(transcript_text, chunk_size=CHUNK_SIZE)
+
+            summaries = []
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=console,
+                transient=True,
+            ) as progress:
+                task = progress.add_task(
+                    f"processing {len(chunks)} chunks via oMLX...", total=len(chunks)
+                )
+                for i, chunk in enumerate(chunks):
+                    chunk_prompt = f"transcript chunk {i + 1}/{len(chunks)}:\n{chunk}"
+                    summary = self._call_omlx(system_prompt, chunk_prompt)
+                    summaries.append(summary)
+                    progress.update(task, advance=1)
+
+            # merge summaries
+            if len(summaries) > 1:
+                merge_prompt = (
+                    "merge these partial summaries into one final summary:\n\n"
+                    + "\n---\n".join(summaries)
+                )
+                final_summary = self._call_omlx(system_prompt, merge_prompt)
+            else:
+                final_summary = summaries[0]
+        else:
+            # single pass for short transcripts
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("generating summary via oMLX..."),
+                console=console,
+                transient=True,
+            ) as progress:
+                progress.add_task("", total=None)
+                final_summary = self._call_omlx(system_prompt, user_prompt)
+
+        duration = time.time() - start_time
+        console.print(f"[green]✓[/green] summary generated in {duration:.1f}s (oMLX)")
+
+        return final_summary
+
+    def _check_server(self) -> bool:
+        """quick health check on oMLX server."""
+        try:
+            req = urllib.request.Request(f"{self.base_url}/models")
+            if self.api_key:
+                req.add_header("Authorization", f"Bearer {self.api_key}")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
+    def _call_omlx(self, system_prompt: str, user_prompt: str) -> str:
+        """
+        make a single chat completion call to oMLX.
+
+        args:
+            system_prompt: system instructions
+            user_prompt: user input with transcript
+
+        returns:
+            generated text from the model
+        """
+        payload: dict = {
+            "model": self.model_name,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "stream": False,
+        }
+
+        data = _json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self.base_url}/chat/completions",
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+            },
+        )
+        if self.api_key:
+            req.add_header("Authorization", f"Bearer {self.api_key}")
+
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                result = _json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode("utf-8", errors="replace") if e.fp else ""
+            raise RuntimeError(
+                f"oMLX API error {e.code}: {error_body[:500]}"
+            ) from e
+        except urllib.error.URLError as e:
+            raise ConnectionError(
+                f"cannot connect to oMLX at {self.base_url}: {e.reason}"
+            ) from e
+
+        raw_output = result["choices"][0]["message"]["content"].strip()
+
+        # clean thinking tags if present
+        if self.enable_thinking and ("<think" in raw_output.lower() or "</think" in raw_output.lower()):
+            console.print("[dim]detected thinking tags in output, cleaning...[/dim]")
+            raw_output = _clean_thinking_tags(raw_output)
+
+        # warn if output seems empty
+        if not raw_output or len(raw_output) < 10:
+            console.print("[yellow]⚠ output seems very short after cleaning[/yellow]")
+
+        return raw_output
+
+
+# ---------------------------------------------------------------------------
+# SummarizationService — in-process mlx-lm / mlx-vlm inference (original)
+# ---------------------------------------------------------------------------
 
 
 class SummarizationService:
@@ -124,6 +564,7 @@ class SummarizationService:
             meeting_title: optional meeting title
             attendees: optional list of attendees
             has_speaker_info: whether transcript includes speaker labels
+            manual_notes_path: optional path to user's manual notes file
 
         returns:
             markdown-formatted summary
@@ -134,133 +575,15 @@ class SummarizationService:
         console.print("[cyan]generating meeting summary...[/cyan]")
         start_time = time.time()
 
-        # prepare prompt for detailed summary
-        if has_speaker_info:
-            system_prompt = (
-                "you are a world-class executive assistant who creates comprehensive, actionable meeting summaries. "
-                "the transcript includes speaker labels (e.g., [Speaker 1], [Speaker 2]). "
-                "analyze the transcript and produce detailed notes with these exact sections:\n\n"
-                "## Meeting Title\n"
-                "generate a concise title (2-4 words) that captures the main topic of the meeting.\n"
-                "the title should be in PascalCase with no spaces (e.g., 'ProductRoadmap', 'TeamRetrospective').\n"
-                "write only the title on a single line, nothing else in this section.\n\n"
-                "## Summary\n"
-                "provide a comprehensive 3-5 paragraph summary covering:\n"
-                "- main topics discussed and context\n"
-                "- key points raised by specific speakers\n"
-                "- important details, data, or examples mentioned\n"
-                "- overall meeting outcome and next steps\n\n"
-                "## Participants\n"
-                "list the speakers identified in the transcript:\n"
-                "- note their key contributions or roles in the discussion\n"
-                "- identify who led the meeting if apparent\n\n"
-                "## Key Discussion Points\n"
-                "list 5-10 bullet points of the most important topics discussed:\n"
-                "- include specific details and context for each point\n"
-                "- attribute key points to specific speakers when relevant\n"
-                "- note any disagreements or alternative viewpoints between speakers\n"
-                "- highlight critical information or insights shared\n\n"
-                "## Decisions Made\n"
-                "list all decisions made during the meeting:\n"
-                "- be specific about what was decided\n"
-                "- include rationale if discussed\n"
-                "- note which speaker made or supported the decision\n"
-                "- if no decisions were made, write 'no formal decisions made'\n\n"
-                "## Action Items\n"
-                "list all tasks and follow-ups mentioned:\n"
-                "- format: - [ ] owner (Speaker X) — detailed task description (due: yyyy-mm-dd)\n"
-                "- if no owner mentioned, use 'tbd' as owner\n"
-                "- if no date mentioned, use 'tbd' for date\n"
-                "- include context for why each action is needed\n"
-                "- if no action items, write 'no action items identified'\n\n"
-                "## Notable Quotes\n"
-                "include 2-3 important verbatim quotes with speaker attribution\n\n"
-                "## Meeting Tone\n"
-                "briefly describe the overall tone and energy of the meeting.\n\n"
-                "IMPORTANT GUIDELINES:\n"
-                "- DO NOT attempt to identify or include the actual names of meeting participants. "
-                "The transcription system is unreliable with names, so refer to speakers only by their labels (e.g., 'Speaker 1', 'Speaker 2').\n"
-                "- DO NOT expand acronyms or assume what they mean. Write acronyms exactly as spoken (e.g., write 'API' not 'Application Programming Interface'). "
-                "The summarization process tends to make errors when expanding abbreviations.\n\n"
-                "be thorough and detailed while maintaining clarity. "
-                "do not include any thinking tags or meta-commentary."
-            )
-        else:
-            system_prompt = (
-                "you are a world-class executive assistant who creates comprehensive, actionable meeting summaries. "
-                "analyze the transcript and produce detailed notes with these exact sections:\n\n"
-                "## Meeting Title\n"
-                "generate a concise title (2-4 words) that captures the main topic of the meeting.\n"
-                "the title should be in PascalCase with no spaces (e.g., 'ProductRoadmap', 'TeamRetrospective').\n"
-                "write only the title on a single line, nothing else in this section.\n\n"
-                "## Summary\n"
-                "provide a comprehensive 3-5 paragraph summary covering:\n"
-                "- main topics discussed and context\n"
-                "- key points raised by participants\n"
-                "- important details, data, or examples mentioned\n"
-                "- overall meeting outcome and next steps\n\n"
-                "## Participants\n"
-                "list any participants mentioned or implied in the transcript.\n\n"
-                "## Key Discussion Points\n"
-                "list 5-10 bullet points of the most important topics discussed:\n"
-                "- include specific details and context for each point\n"
-                "- note any disagreements or alternative viewpoints\n"
-                "- highlight critical information or insights shared\n\n"
-                "## Decisions Made\n"
-                "list all decisions made during the meeting:\n"
-                "- be specific about what was decided\n"
-                "- include rationale if discussed\n"
-                "- note who made or supported the decision\n"
-                "- if no decisions were made, write 'no formal decisions made'\n\n"
-                "## Action Items\n"
-                "list all tasks and follow-ups mentioned:\n"
-                "- format: - [ ] owner — detailed task description (due: yyyy-mm-dd)\n"
-                "- if no owner mentioned, use 'tbd' as owner\n"
-                "- if no date mentioned, use 'tbd' for date\n"
-                "- include context for why each action is needed\n"
-                "- if no action items, write 'no action items identified'\n\n"
-                "## Notable Quotes\n"
-                "include 2-3 important verbatim quotes that capture key insights or decisions\n\n"
-                "## Meeting Tone\n"
-                "briefly describe the overall tone and energy of the meeting.\n\n"
-                "IMPORTANT GUIDELINES:\n"
-                "- DO NOT attempt to identify or include the actual names of meeting participants. "
-                "The transcription system is unreliable with names, so refer to participants generically (e.g., 'one participant mentioned', 'a team member noted').\n"
-                "- DO NOT expand acronyms or assume what they mean. Write acronyms exactly as spoken (e.g., write 'API' not 'Application Programming Interface'). "
-                "The summarization process tends to make errors when expanding abbreviations.\n\n"
-                "be thorough and detailed while maintaining clarity. "
-                "do not include any thinking tags or meta-commentary."
-            )
-
-        # read manual notes if available
-        manual_notes_text = ""
-        if manual_notes_path and manual_notes_path.exists():
-            try:
-                with open(manual_notes_path, encoding="utf-8") as f:
-                    manual_notes_text = f.read()
-                console.print("[dim]manual notes found, including in summary[/dim]")
-            except Exception as e:
-                console.print(f"[yellow]⚠[/yellow] could not read manual notes: {e}")
-
-        # build user prompt with manual notes
-        user_prompt_parts = []
-
-        if meeting_title:
-            user_prompt_parts.append(f"meeting: {meeting_title}")
-        if attendees:
-            user_prompt_parts.append(f"attendees: {', '.join(attendees)}")
-
-        # add manual notes first if available
-        if manual_notes_text:
-            user_prompt_parts.append(f"manual notes:\n{manual_notes_text}")
-
-        user_prompt_parts.append(f"transcript:\n{transcript_text}")
-        user_prompt = "\n\n".join(user_prompt_parts)
+        system_prompt = _build_system_prompt(has_speaker_info)
+        user_prompt = _build_user_prompt(
+            transcript_text, meeting_title, attendees, manual_notes_path
+        )
 
         # chunk if needed
         summaries = []
         if len(user_prompt) > CHUNK_THRESHOLD:
-            chunks = self._chunk_transcript(transcript_text, chunk_size=CHUNK_SIZE)
+            chunks = _chunk_transcript(transcript_text, chunk_size=CHUNK_SIZE)
 
             with Progress(
                 SpinnerColumn(),
@@ -369,7 +692,7 @@ class SummarizationService:
         if self.enable_thinking:
             if "<think" in raw_output.lower() or "</think" in raw_output.lower():
                 console.print("[dim]detected thinking tags in output, cleaning...[/dim]")
-            raw_output = self._clean_thinking_tags(raw_output)
+            raw_output = _clean_thinking_tags(raw_output)
 
         # warn if output seems empty after cleaning
         if not raw_output or len(raw_output) < 10:
@@ -377,78 +700,19 @@ class SummarizationService:
 
         return raw_output
 
+    # backward-compatible instance method wrappers (delegate to module-level functions)
     def _clean_thinking_tags(self, text: str) -> str:
-        """
-        remove thinking tags from llm output.
+        """remove thinking tags from llm output (delegates to module-level function)."""
+        return _clean_thinking_tags(text)
 
-        qwen3-thinking models include <think>...</think> tags that should be removed.
-        handles edge cases like malformed tags, missing opening tags, etc.
+    def _chunk_transcript(self, text: str, chunk_size: int = CHUNK_SIZE) -> list[str]:
+        """split transcript into chunks (delegates to module-level function)."""
+        return _chunk_transcript(text, chunk_size)
 
-        args:
-            text: raw llm output possibly containing thinking tags
 
-        returns:
-            cleaned text without thinking tags
-        """
-        # handle case where content appears before </think> without opening tag
-        # this catches everything from start until </think> if no opening tag exists
-        if "</think>" in text.lower() and "<think" not in text.lower():
-            # find the position of </think> and remove everything before it
-            pattern = r"(?is)^.*?</think\s*>"
-            cleaned = re.sub(pattern, "", text)
-        else:
-            # standard removal of <think>...</think> with content
-            # (?is) = case-insensitive and dot matches newlines
-            # [^>]*? = allows attributes or malformed opening tags
-            cleaned = re.sub(r"(?is)<think[^>]*?>.*?</think\s*>", "", text)
-
-        # also handle <thinking>...</thinking> variant
-        if "</thinking>" in cleaned.lower() and "<thinking" not in cleaned.lower():
-            pattern = r"(?is)^.*?</thinking\s*>"
-            cleaned = re.sub(pattern, "", cleaned)
-        else:
-            cleaned = re.sub(r"(?is)<thinking[^>]*?>.*?</thinking\s*>", "", cleaned)
-
-        # remove any remaining lone tags (opening or closing)
-        cleaned = re.sub(r"(?i)</?think[^>]*?>", "", cleaned)
-        cleaned = re.sub(r"(?i)</?thinking[^>]*?>", "", cleaned)
-
-        # clean up any extra whitespace that may be left
-        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)  # collapse multiple newlines
-        cleaned = re.sub(r"^\n+", "", cleaned)  # remove leading newlines
-
-        return cleaned.strip()
-
-    def _chunk_transcript(self, text: str, chunk_size: int) -> list[str]:
-        """
-        split transcript into chunks for processing.
-
-        args:
-            text: full transcript text
-            chunk_size: approximate size of each chunk in chars
-
-        returns:
-            list of text chunks
-        """
-        chunks = []
-        words = text.split()
-        current_chunk = []
-        current_size = 0
-
-        for word in words:
-            word_len = len(word) + 1  # +1 for space
-            if current_size + word_len > chunk_size and current_chunk:
-                chunks.append(" ".join(current_chunk))
-                current_chunk = [word]
-                current_size = word_len
-            else:
-                current_chunk.append(word)
-                current_size += word_len
-
-        if current_chunk:
-            chunks.append(" ".join(current_chunk))
-
-        return chunks
+# ---------------------------------------------------------------------------
+# Public utility functions
+# ---------------------------------------------------------------------------
 
 
 def save_summary(summary_text: str, base_path: Path, transcript_text: str = "") -> Path:
@@ -508,8 +772,6 @@ def extract_meeting_title(summary_text: str, transcript_text: str = "") -> str:
     returns:
         meeting title in PascalCase format (no spaces)
     """
-    import re
-
     # try to extract from ## Meeting Title section
     title_match = re.search(r"## Meeting Title\s*\n([^\n]+)", summary_text, re.IGNORECASE)
     if title_match:

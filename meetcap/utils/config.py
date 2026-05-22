@@ -66,6 +66,10 @@ class Config:
             "models_dir": "~/.meetcap/models",  # directory for auto-downloaded models
         },
         "llm": {
+            "backend": "mlx-lm",  # llm backend: "mlx-lm" (in-process) or "omlx" (server)
+            "omlx_base_url": "http://localhost:8000/v1",  # oMLX server API endpoint
+            "omlx_api_key": "",  # oMLX API key (empty = no auth)
+            "omlx_timeout": 300,  # oMLX request timeout in seconds
             "temperature": 0.4,
             "max_tokens": 4096,
             "enable_thinking": False,  # disable thinking by default for faster output
