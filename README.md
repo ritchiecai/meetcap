@@ -9,6 +9,7 @@ Offline meeting recorder & summarizer for macOS
 - Local transcription using Parakeet TDT (default, Apple Silicon) or Whisper
 - Local summarization using Qwen3.5-4B via MLX (Apple Silicon native)
 - Speaker diarization via sherpa-onnx (identifies who said what)
+- LLM-based transcript refinement with custom hotwords (fix homophones, brand names, jargon)
 - Simple CLI workflow: start recording → stop with hotkey → get transcript & summary
 
 ## Installation
@@ -149,6 +150,9 @@ meetcap summarize samples/meeting.m4a --out ./processed
 
 # Reprocess a recording with different models
 meetcap reprocess 2025_Jan_15_TeamStandup --mode stt
+
+# Refine an existing transcript with LLM + hotwords
+meetcap refine 2025_Jan_15_TeamStandup --hotwords-file ~/.meetcap/hotwords.txt
 ```
 
 ### Configuration
@@ -189,6 +193,67 @@ meetcap supports multiple speech-to-text engines:
    ```
 
 Speaker identification improves summaries by attributing statements to specific speakers.
+
+### Transcript Refinement (LLM Post-Editing)
+
+ASR engines often mis-transcribe domain-specific terms (product names, code identifiers, foreign acronyms, people's names). meetcap can run a local LLM after STT to correct these errors **without re-running speech recognition**, while preserving timestamps and speaker labels.
+
+**Quick start:**
+
+```bash
+# 1. Create a hotwords file with terms the ASR struggles with
+cat > ~/.meetcap/hotwords.txt <<'EOF'
+# One term per line. Lines starting with # are comments.
+TCADP
+Cognito
+Jucoin
+Kubernetes
+PT Cyrameta
+EOF
+
+# 2. Enable refinement in ~/.meetcap/config.toml
+#    (see [refinement] section below)
+
+# 3. Refine an existing recording in place
+meetcap refine ~/Recordings/2026_May_23_TeamSync --hotwords-file ~/.meetcap/hotwords.txt
+```
+
+When `[refinement].enabled = true`, refinement runs automatically as part of the normal pipeline (record / summarize / reprocess) — right after STT and before summarization, so the summary benefits from the corrected transcript.
+
+**Configuration (`~/.meetcap/config.toml`):**
+
+```toml
+[refinement]
+enabled = false                  # set to true to enable in the pipeline
+mode = "diff"                    # "diff" (recommended) preserves segments & timestamps
+backend = ""                     # "mlx-lm" or "omlx"; empty inherits from [llm].backend
+model_name = ""                  # empty inherits from [llm].model_path / [omlx].model
+temperature = 0.0
+max_tokens = 1024
+preserve_filler_words = true     # don't drop um/uh — only fix wrong words
+hotwords_file = "~/.meetcap/hotwords.txt"
+hotwords = []                    # inline list, merged with hotwords_file
+segs_per_chunk = 12              # how many segments to send per LLM call
+max_chars_per_chunk = 3000
+keep_original = true             # save .transcript.original.{txt,json} backups
+```
+
+**What it does:**
+
+- Splits the transcript into chunks of ≤ `segs_per_chunk` segments (or ≤ `max_chars_per_chunk` characters), keeping speaker turns intact.
+- Sends each chunk plus the hotword list to the LLM with a strict JSON-only system prompt asking for `[{seg_index, original, corrected, reason}]`.
+- Validates the response, applies word-level substring replacement on each affected segment, and rewrites `recording.transcript.{txt,json}` in place.
+- Saves an audit log to `recording.corrections.json` listing every change with its reason.
+- Backs up the pre-refinement files to `recording.transcript.original.{txt,json}` (when `keep_original = true`).
+
+**Trade-offs vs. ASR-native hotword injection:**
+
+- ✅ Works with any STT engine (mlx-whisper, faster-whisper, parakeet, vosk).
+- ✅ No retranscription cost — runs on text only.
+- ✅ Easy to iterate: edit hotwords, run `meetcap refine` again.
+- ⚠️ The LLM can hallucinate; `mode = "diff"` and a low `temperature` (0.0) minimize this. Always review `corrections.json`.
+
+See `docs/refinement.md` for a deeper dive, prompt design, and chunking algorithm.
 
 ## Permissions
 

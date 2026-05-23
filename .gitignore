@@ -74,3 +74,6 @@ coverage.xml
 
 # Samples
 samples/
+
+# WorkBuddy local memory / scratch
+.workbuddy/

@@ -1,0 +1,53 @@
+# meetcap hotwords — example template
+#
+# One term per line. Lines starting with `#` and blank lines are ignored.
+# Whitespace at the ends of lines is stripped.
+# Use this file to teach the LLM refinement stage which proper nouns,
+# acronyms, brand names, and jargon the ASR tends to mis-transcribe.
+#
+# Copy to ~/.meetcap/hotwords.txt and edit for your own vocabulary.
+# See docs/refinement.md for details.
+
+# ---- Tencent Cloud products ----
+TCADP
+TKE
+COS
+CDB
+CKafka
+TencentDB
+TencentCloud
+
+# ---- Cloud / infra terms ----
+Kubernetes
+Terraform
+gRPC
+GraphQL
+PostgreSQL
+ClickHouse
+
+# ---- AI / ML jargon ----
+LLM
+ASR
+RAG
+MLX
+Whisper
+Parakeet
+Cognito
+Bedrock
+SageMaker
+
+# ---- People (examples — replace with your own) ----
+Andrej Karpathy
+Geoffrey Hinton
+Sam Altman
+
+# ---- Customers / projects (examples) ----
+Jucoin
+PT Cyrameta
+meetcap
+
+# ---- Chinese terms the ASR sometimes mishears ----
+腾讯云
+飞书
+乐享
+多维表格
