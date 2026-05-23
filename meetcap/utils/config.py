@@ -92,6 +92,20 @@ class Config:
             "template": "# Meeting Notes\n\n*Add your notes here during or after the meeting*\n\n*This file will be included in the final summary*\n",  # template for new notes files
             "filename": "notes.md",  # default notes file name
         },
+        "refinement": {
+            "enabled": False,  # opt-in: run an LLM correction pass after STT
+            "mode": "diff",  # "diff" (safe, segment-level edits) or "full"
+            "backend": "",  # "" = inherit from [llm].backend; or "mlx-lm" / "omlx"
+            "model_name": "",  # "" = inherit from [models].llm_model_name
+            "temperature": 0.1,  # low temp -> conservative corrections
+            "max_tokens": 2048,
+            "preserve_filler_words": True,  # keep "um", "嗯", etc.
+            "hotwords_file": "~/.meetcap/hotwords.txt",  # one term per line
+            "hotwords": [],  # additional inline terms (merged with file)
+            "segs_per_chunk": 80,  # segments per LLM call
+            "max_chars_per_chunk": 6000,  # char budget per LLM call
+            "keep_original": True,  # save .transcript.original.{txt,json} backups
+        },
     }
 
     def __init__(self, config_path: Path | None = None):
@@ -180,6 +194,28 @@ class Config:
             ),
             "MEETCAP_NOTES_TEMPLATE": ("notes", "template"),
             "MEETCAP_NOTES_FILENAME": ("notes", "filename"),
+            # transcript refinement settings
+            "MEETCAP_REFINEMENT_ENABLED": (
+                "refinement",
+                "enabled",
+                lambda x: x.lower() == "true",
+            ),
+            "MEETCAP_REFINEMENT_MODE": ("refinement", "mode"),
+            "MEETCAP_REFINEMENT_BACKEND": ("refinement", "backend"),
+            "MEETCAP_REFINEMENT_MODEL": ("refinement", "model_name"),
+            "MEETCAP_REFINEMENT_TEMPERATURE": ("refinement", "temperature", float),
+            "MEETCAP_REFINEMENT_MAX_TOKENS": ("refinement", "max_tokens", int),
+            "MEETCAP_REFINEMENT_HOTWORDS_FILE": ("refinement", "hotwords_file"),
+            "MEETCAP_REFINEMENT_KEEP_ORIGINAL": (
+                "refinement",
+                "keep_original",
+                lambda x: x.lower() == "true",
+            ),
+            "MEETCAP_REFINEMENT_PRESERVE_FILLERS": (
+                "refinement",
+                "preserve_filler_words",
+                lambda x: x.lower() == "true",
+            ),
         }
 
         for env_var, path_spec in env_mapping.items():
