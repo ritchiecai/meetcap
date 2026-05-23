@@ -46,9 +46,17 @@ from meetcap.services.transcription import (
     FasterWhisperService,
     MlxWhisperService,
     ParakeetService,
+    TranscriptResult,
+    TranscriptSegment,
     VoskTranscriptionService,
     WhisperCppService,
     save_transcript,
+)
+from meetcap.services.refinement import (
+    RefinementService,
+    backup_original_transcript,
+    load_hotwords,
+    save_corrections_log,
 )
 from meetcap.utils.config import Config
 from meetcap.utils.logger import ErrorHandler, logger
@@ -849,6 +857,18 @@ class RecordingOrchestrator:
             # explicitly unload model after transcription
             self._cleanup_service(stt_service, "stt")
 
+            # optional: LLM-based refinement pass (corrects homophones,
+            # mis-recognized terms, hotwords). Runs after STT model is
+            # unloaded so the refinement model can use that memory.
+            try:
+                self._maybe_refine_transcript(
+                    transcript_result=transcript_result,
+                    base_path=base_path,
+                )
+            except Exception as e:
+                logger.warning(f"transcript refinement skipped due to error: {e}")
+                console.print(f"[yellow]⚠ refinement skipped: {e}[/yellow]")
+
             return text_path, json_path
         except Exception as e:
             logger.error(f"transcription failed: {e}", exc_info=True)
@@ -969,6 +989,116 @@ class RecordingOrchestrator:
             # ensure cleanup on error
             self._cleanup_service(llm_service, "llm")
             return None
+
+    def _maybe_refine_transcript(
+        self,
+        transcript_result: TranscriptResult,
+        base_path: Path,
+    ) -> None:
+        """run an optional LLM refinement pass on the transcript.
+
+        Looks at the [refinement] config section. If disabled, returns
+        immediately. Otherwise:
+          1. backs up the freshly-saved transcript.{txt,json} to .original.*
+          2. runs the LLM diff-mode correction
+          3. overwrites transcript.{txt,json} with the refined version
+          4. mutates transcript_result.segments in place so downstream
+             summarization sees the corrected text
+          5. writes a recording.corrections.json audit log
+        """
+        ref_cfg = self.config.get_section("refinement")
+        if not ref_cfg.get("enabled", False):
+            return
+
+        if not transcript_result.segments:
+            console.print("[dim]refinement skipped: empty transcript[/dim]")
+            return
+
+        console.print("\n[bold]✏️ transcript refinement[/bold]")
+
+        # resolve backend / model with sensible inheritance from [llm] / [models]
+        llm_cfg = self.config.get_section("llm")
+        backend = ref_cfg.get("backend") or llm_cfg.get("backend", "mlx-lm")
+        model_name = ref_cfg.get("model_name") or self.config.get(
+            "models", "llm_model_name", "mlx-community/Qwen3.5-2B-OptiQ-4bit"
+        )
+
+        # gather hotwords (file + inline)
+        hotwords_file_str = ref_cfg.get("hotwords_file", "")
+        hotwords_file: Path | None = None
+        if hotwords_file_str:
+            hotwords_file = self.config.expand_path(hotwords_file_str)
+        hotwords = load_hotwords(
+            hotwords_inline=ref_cfg.get("hotwords") or [],
+            hotwords_file=hotwords_file,
+        )
+        if hotwords:
+            console.print(
+                f"[dim]hotword vocabulary: {len(hotwords)} term(s)"
+                + (f" from {hotwords_file}" if hotwords_file and hotwords_file.exists() else "")
+                + "[/dim]"
+            )
+
+        # build service
+        try:
+            ref_service = RefinementService(
+                model_name=model_name,
+                backend=backend,
+                mode=ref_cfg.get("mode", "diff"),
+                temperature=float(ref_cfg.get("temperature", 0.1)),
+                max_tokens=int(ref_cfg.get("max_tokens", 2048)),
+                hotwords=hotwords,
+                preserve_filler_words=bool(
+                    ref_cfg.get("preserve_filler_words", True)
+                ),
+                base_url=llm_cfg.get("omlx_base_url", "http://localhost:8000/v1"),
+                api_key=llm_cfg.get("omlx_api_key", ""),
+                timeout=int(llm_cfg.get("omlx_timeout", 300)),
+                segs_per_chunk=int(ref_cfg.get("segs_per_chunk", 80)),
+                max_chars_per_chunk=int(ref_cfg.get("max_chars_per_chunk", 6000)),
+            )
+        except Exception as e:
+            console.print(f"[yellow]⚠ could not initialize refinement service: {e}[/yellow]")
+            return
+
+        try:
+            if hasattr(ref_service, "load_model"):
+                ref_service.load_model()
+
+            result = ref_service.refine(transcript_result)
+
+            if not result.corrections:
+                # nothing to do; don't touch existing transcript files
+                self._cleanup_service(ref_service, "refinement")
+                return
+
+            # back up original before overwriting
+            keep_original = bool(ref_cfg.get("keep_original", True))
+            if keep_original:
+                backup_original_transcript(base_path)
+
+            # update transcript_result in-place so downstream code (summary,
+            # title extraction, json metadata) operates on refined text
+            transcript_result.segments = result.refined_segments
+
+            # rewrite transcript.{txt,json}
+            save_transcript(transcript_result, base_path)
+
+            # write audit log
+            save_corrections_log(
+                result.corrections,
+                base_path,
+                metadata={
+                    "backend": result.backend,
+                    "mode": ref_cfg.get("mode", "diff"),
+                    "model_name": model_name,
+                    "hotword_count": len(hotwords),
+                    "skipped_chunks": result.skipped_chunks,
+                    "duration_seconds": round(result.duration_seconds, 2),
+                },
+            )
+        finally:
+            self._cleanup_service(ref_service, "refinement")
 
     def _get_stt_model_name(self, stt_engine: str) -> str:
         """return the configured model name for a given STT engine."""
@@ -2365,6 +2495,151 @@ def setup(
             expand=False,
         )
     )
+
+
+@app.command()
+def refine(
+    path: str = typer.Argument(
+        ...,
+        help="path to recording directory or transcript JSON file",
+    ),
+    hotwords_file: str | None = typer.Option(
+        None,
+        "--hotwords-file",
+        help="override the hotwords file path (one term per line)",
+    ),
+    backend: str | None = typer.Option(
+        None,
+        "--backend",
+        help="LLM backend: 'mlx-lm' or 'omlx' (defaults to [refinement].backend or [llm].backend)",
+    ),
+    llm: str | None = typer.Option(
+        None,
+        "--llm",
+        help="huggingface repo id or oMLX model name to use for refinement",
+    ),
+    mode: str = typer.Option(
+        "diff",
+        "--mode",
+        help="refinement mode: 'diff' (safe) or 'full'",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="overwrite existing transcript files without confirmation",
+    ),
+    log_file: str | None = typer.Option(
+        None,
+        "--log-file",
+        help="path to log file",
+    ),
+) -> None:
+    """run an LLM refinement pass on an existing transcript.
+
+    This is a standalone command that takes either a recording directory
+    (containing recording.transcript.json) or a transcript JSON path
+    directly, and produces:
+
+    \b
+    - recording.transcript.original.{txt,json}  (backup of input)
+    - recording.transcript.{txt,json}           (refined output)
+    - recording.corrections.json                (audit log)
+    """
+    if log_file:
+        logger.add_file_handler(Path(log_file))
+
+    config = Config()
+
+    # resolve transcript json path
+    target = Path(path)
+    if target.is_dir():
+        json_path = target / "recording.transcript.json"
+        base_path = target / "recording"
+    elif target.is_file() and target.name.endswith(".transcript.json"):
+        json_path = target
+        # strip .transcript.json -> base_path is "<dir>/<stem>"
+        base_path = target.with_name(target.name[: -len(".transcript.json")])
+    else:
+        # also try as recording-name shortcut against configured out_dir
+        orchestrator_tmp = RecordingOrchestrator(config)
+        rec_dir = orchestrator_tmp._resolve_recording_path(path)
+        if rec_dir and (rec_dir / "recording.transcript.json").exists():
+            json_path = rec_dir / "recording.transcript.json"
+            base_path = rec_dir / "recording"
+        else:
+            console.print(f"[red]error: cannot locate transcript for {path}[/red]")
+            raise typer.Exit(1)
+
+    if not json_path.exists():
+        console.print(f"[red]error: transcript not found: {json_path}[/red]")
+        raise typer.Exit(1)
+
+    # load transcript json into TranscriptResult
+    import json as _json
+
+    with open(json_path, encoding="utf-8") as f:
+        data = _json.load(f)
+
+    segments = [
+        TranscriptSegment(
+            id=int(s["id"]),
+            start=float(s.get("start", 0.0)),
+            end=float(s.get("end", 0.0)),
+            text=str(s.get("text", "")),
+            speaker_id=s.get("speaker_id"),
+            confidence=s.get("confidence"),
+        )
+        for s in data.get("segments", [])
+    ]
+    transcript_result = TranscriptResult(
+        audio_path=str(data.get("audio_path", "")),
+        sample_rate=int(data.get("sample_rate", 16000)),
+        language=str(data.get("language", "")),
+        segments=segments,
+        duration=float(data.get("duration", 0.0)),
+        stt=data.get("stt", {}),
+        speakers=data.get("speakers"),
+        diarization_enabled=bool(data.get("diarization_enabled", False)),
+    )
+
+    if not segments:
+        console.print("[yellow]transcript is empty, nothing to refine[/yellow]")
+        raise typer.Exit(0)
+
+    # confirm before overwriting
+    if not yes:
+        proceed = typer.confirm(
+            f"refine {len(segments)} segment(s) and overwrite {json_path.name}?",
+            default=True,
+        )
+        if not proceed:
+            console.print("[yellow]refinement cancelled[/yellow]")
+            raise typer.Exit(0)
+
+    # apply CLI overrides on top of config
+    config.config.setdefault("refinement", {})
+    ref_cfg = config.config["refinement"]
+    ref_cfg["enabled"] = True  # standalone command always runs the pass
+    ref_cfg["mode"] = mode
+    if backend:
+        ref_cfg["backend"] = backend
+    if llm:
+        ref_cfg["model_name"] = llm
+    if hotwords_file:
+        ref_cfg["hotwords_file"] = hotwords_file
+
+    # run refinement via orchestrator helper (reuses the exact same code path
+    # as the in-pipeline refinement)
+    orchestrator = RecordingOrchestrator(config)
+    try:
+        orchestrator._maybe_refine_transcript(
+            transcript_result=transcript_result,
+            base_path=base_path,
+        )
+    except Exception as e:
+        console.print(f"[red]refinement failed: {e}[/red]")
+        ErrorHandler.handle_runtime_error(e)
 
 
 @app.command()
