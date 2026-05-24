@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 
@@ -30,11 +31,21 @@ class ProcessScreen(Screen):
         self._audio_path = audio_path
         self._mode = mode  # "stt" = full pipeline, "summary" = summary-only
         self._processing = False
+        # heartbeat state for long-running, callback-less stages
+        # (e.g. mlx-whisper transcribe, summarization subprocess).
+        self._heartbeat_stop: threading.Event | None = None
+        self._heartbeat_thread: threading.Thread | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
         with Vertical(id="process-container"):
             yield Static("Processing Pipeline", id="process-title")
+            # always-visible status banner so the user knows what is
+            # happening even before the first log line is written.
+            yield Static(
+                "Initializing...",
+                id="process-status-banner",
+            )
             from meetcap.tui.widgets.pipeline import PipelineProgress
 
             yield PipelineProgress(id="pipeline-progress")
@@ -90,6 +101,75 @@ class ProcessScreen(Screen):
         except Exception:
             pass
 
+    def _set_status(self, message: str, severity: str = "info") -> None:
+        """update the always-visible status banner.
+
+        severity: info (default), working, success, warn, error.
+        """
+        color_map = {
+            "info": "cyan",
+            "working": "yellow",
+            "success": "green",
+            "warn": "yellow",
+            "error": "red",
+        }
+        color = color_map.get(severity, "cyan")
+        try:
+            banner = self.query_one("#process-status-banner", Static)
+            banner.update(f"[bold {color}]{message}[/bold {color}]")
+        except Exception:
+            pass
+
+    def _start_heartbeat(self, stage_label: str) -> None:
+        """start a background heartbeat that prints reassurance every ~10s.
+
+        used during opaque, long-running operations (mlx-whisper transcribe,
+        summarization subprocess) where there is no progress callback.
+        the message tells the user the work is still running.
+        """
+        # stop any previous heartbeat first
+        self._stop_heartbeat()
+
+        stop_event = threading.Event()
+        self._heartbeat_stop = stop_event
+        started_at = time.time()
+
+        def _beat() -> None:
+            # first reassurance after a short delay so quick stages don't
+            # spam the log unnecessarily.
+            interval = 10.0
+            next_tick = started_at + interval
+            while not stop_event.is_set():
+                # poll in small increments to react to stop quickly
+                if time.time() >= next_tick:
+                    elapsed = time.time() - started_at
+                    try:
+                        self.app.call_from_thread(
+                            self._log,
+                            f"[dim]{stage_label}: still working... ({elapsed:.0f}s elapsed)[/dim]",
+                        )
+                    except Exception:
+                        return
+                    next_tick = time.time() + interval
+                if stop_event.wait(timeout=0.5):
+                    return
+
+        thread = threading.Thread(target=_beat, daemon=True)
+        self._heartbeat_thread = thread
+        thread.start()
+
+    def _stop_heartbeat(self) -> None:
+        """stop the background heartbeat thread, if any."""
+        if self._heartbeat_stop is not None:
+            self._heartbeat_stop.set()
+        if self._heartbeat_thread is not None:
+            try:
+                self._heartbeat_thread.join(timeout=1.0)
+            except Exception:
+                pass
+        self._heartbeat_stop = None
+        self._heartbeat_thread = None
+
     def _check_memory(self, model_type: str, model_name: str) -> bool:
         """check memory before loading a model. returns True if safe to proceed."""
         try:
@@ -121,6 +201,8 @@ class ProcessScreen(Screen):
         try:
             from meetcap.utils.config import Config
 
+            self.app.call_from_thread(self._set_status, "Loading configuration...", "info")
+
             config = Config()
             stt_engine = config.get("models", "stt_engine", "parakeet")
             llm_model = config.get(
@@ -142,6 +224,11 @@ class ProcessScreen(Screen):
                 transcript_text = self._read_existing_transcript(audio_path)
                 if transcript_text is None:
                     self.app.call_from_thread(
+                        self._set_status,
+                        "No existing transcript found",
+                        "error",
+                    )
+                    self.app.call_from_thread(
                         self._log,
                         "[red]No existing transcript found for summary-only reprocess[/red]",
                     )
@@ -156,15 +243,37 @@ class ProcessScreen(Screen):
                 # full pipeline: STT
                 # memory check before STT
                 stt_model = self._get_stt_model_name(config, stt_engine)
+                self.app.call_from_thread(
+                    self._set_status,
+                    "Checking available memory for STT model...",
+                    "working",
+                )
                 if not self._check_memory("stt", stt_model):
+                    self.app.call_from_thread(
+                        self._set_status,
+                        "Insufficient memory — close other apps",
+                        "error",
+                    )
                     return
 
                 self.app.call_from_thread(self._update_stage, "stt", "active")
-                self.app.call_from_thread(self._log, f"Starting STT ({stt_engine})...")
+                stt_short = stt_model.split("/")[-1]
+                self.app.call_from_thread(
+                    self._set_status,
+                    f"STT ({stt_engine}): loading {stt_short}...",
+                    "working",
+                )
+                self.app.call_from_thread(
+                    self._log,
+                    f"Starting STT ({stt_engine}). Loading {stt_short} — first run may download model (~1-3 GB).",
+                )
                 stt_start = time.time()
+                # heartbeat reassures during opaque transcribe call
+                self.app.call_from_thread(self._start_heartbeat, "STT")
 
                 result = self._run_stt(audio_path, config, stt_engine)
 
+                self.app.call_from_thread(self._stop_heartbeat)
                 stt_time = time.time() - stt_start
                 seg_count = len(result.segments) if result else 0
                 self.app.call_from_thread(
@@ -177,11 +286,34 @@ class ProcessScreen(Screen):
 
                 if not result:
                     self.app.call_from_thread(
+                        self._set_status,
+                        "STT produced no result — check audio language / engine",
+                        "error",
+                    )
+                    self.app.call_from_thread(
                         self._log,
                         "[red]STT produced no result[/red]",
                     )
                     return
 
+                if seg_count == 0:
+                    self.app.call_from_thread(
+                        self._set_status,
+                        "STT returned 0 segments — audio may be silent or unsupported language",
+                        "warn",
+                    )
+                    self.app.call_from_thread(
+                        self._log,
+                        "[yellow]Warning: STT returned 0 segments. "
+                        "If the audio contains speech, try switching engine "
+                        "(e.g. mlx-whisper for Chinese/Japanese).[/yellow]",
+                    )
+
+                self.app.call_from_thread(
+                    self._set_status,
+                    f"STT done in {stt_time:.1f}s — {seg_count} segments",
+                    "success",
+                )
                 transcript_text = " ".join(seg.text for seg in result.segments)
 
                 # stage 2: diarization
@@ -189,15 +321,27 @@ class ProcessScreen(Screen):
                 diar_backend = config.get("models", "diarization_backend", "sherpa")
                 if enable_diar and diar_backend == "sherpa" and stt_engine != "vosk":
                     self.app.call_from_thread(self._update_stage, "diarization", "active")
+                    self.app.call_from_thread(
+                        self._set_status,
+                        "Diarization: identifying speakers...",
+                        "working",
+                    )
                     self.app.call_from_thread(self._log, "Running diarization...")
                     diar_start = time.time()
+                    self.app.call_from_thread(self._start_heartbeat, "Diarization")
                     self._run_diarization(audio_path, config, result)
+                    self.app.call_from_thread(self._stop_heartbeat)
                     diar_time = time.time() - diar_start
                     self.app.call_from_thread(
                         self._update_stage,
                         "diarization",
                         "done",
                         timing=diar_time,
+                    )
+                    self.app.call_from_thread(
+                        self._set_status,
+                        f"Diarization done in {diar_time:.1f}s",
+                        "success",
                     )
                 else:
                     self.app.call_from_thread(
@@ -210,7 +354,17 @@ class ProcessScreen(Screen):
             # memory check before LLM (skip for oMLX — it manages its own memory)
             llm_backend = config.get("llm", "backend", "mlx-lm")  # type: ignore[union-attr]
             if llm_backend != "omlx":
+                self.app.call_from_thread(
+                    self._set_status,
+                    "Checking available memory for LLM...",
+                    "working",
+                )
                 if not self._check_memory("llm", llm_model):
+                    self.app.call_from_thread(
+                        self._set_status,
+                        "Insufficient memory for LLM — close other apps",
+                        "error",
+                    )
                     return
 
             # stage 3: summarization
@@ -218,31 +372,52 @@ class ProcessScreen(Screen):
             model_short = llm_model.split("/")[-1]
             backend_label = "oMLX" if llm_backend == "omlx" else "mlx-lm"
             self.app.call_from_thread(
-                self._log, f"Summarizing with {model_short} via {backend_label}..."
+                self._set_status,
+                f"Summarizing with {model_short} via {backend_label} "
+                "(this can take 30s-3min, hang tight)...",
+                "working",
+            )
+            self.app.call_from_thread(
+                self._log,
+                f"Summarizing with {model_short} via {backend_label}. "
+                f"Transcript size: {len(transcript_text)} chars. "
+                "Long meetings will be auto-chunked.",
             )
             sum_start = time.time()
+            self.app.call_from_thread(self._start_heartbeat, "Summarization")
             summary = self._run_summarization(transcript_text, config)
+            self.app.call_from_thread(self._stop_heartbeat)
             sum_time = time.time() - sum_start
             self.app.call_from_thread(
                 self._log, f"Summary generated in {sum_time:.1f}s ({backend_label})"
             )
             self.app.call_from_thread(self._update_stage, "summarization", "done", timing=sum_time)
+            self.app.call_from_thread(
+                self._set_status,
+                f"Summary done in {sum_time:.1f}s",
+                "success",
+            )
 
             # stage 4: organize
             self.app.call_from_thread(self._update_stage, "organize", "active")
+            self.app.call_from_thread(self._set_status, "Organizing files...", "working")
             self.app.call_from_thread(self._log, "Organizing files...")
             self._organize_files(audio_path, result, summary, transcript_text)
             self.app.call_from_thread(self._update_stage, "organize", "done")
 
+            self.app.call_from_thread(self._set_status, "All done!", "success")
             self.app.call_from_thread(self._log, "[green]Processing complete![/green]")
             self.app.call_from_thread(self.notify, "Processing complete!", severity="information")
             self.app.call_from_thread(self._show_results, transcript_text, summary)
             self.app.call_from_thread(self._show_done_button)
 
         except Exception as e:
+            self.app.call_from_thread(self._stop_heartbeat)
+            self.app.call_from_thread(self._set_status, f"Error: {e}", "error")
             self.app.call_from_thread(self._log, f"[red]Error: {e}[/red]")
             self.app.call_from_thread(self._show_done_button)
         finally:
+            self._stop_heartbeat()
             self._processing = False
 
     @staticmethod
@@ -345,6 +520,16 @@ class ProcessScreen(Screen):
                 service = WhisperCppService(model_path=model_path)
 
             service.load_model()
+            self.app.call_from_thread(
+                self._set_status,
+                f"STT ({stt_engine}): model loaded, transcribing audio...",
+                "working",
+            )
+            self.app.call_from_thread(
+                self._log,
+                "[green]Model loaded.[/green] Transcribing audio "
+                "(no progress bar — this is normal, watch the spinner)...",
+            )
             result = service.transcribe(audio_path)
             service.unload_model()
             return result
@@ -604,6 +789,7 @@ print(json.dumps({{"summary": result}}))
     def action_back(self) -> None:
         """handle escape to go back."""
         if not self._processing:
+            self._stop_heartbeat()
             self.app.pop_screen()
         else:
             self.notify("Processing in progress...", severity="warning")

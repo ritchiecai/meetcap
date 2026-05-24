@@ -1054,12 +1054,15 @@ class TestStageWidgetFormatLabel:
         assert "\u2717" in label  # error icon
 
     def test_active_label(self) -> None:
-        from meetcap.tui.widgets.pipeline import StageInfo, StageWidget
+        from meetcap.tui.widgets.pipeline import _SPINNER_FRAMES, StageInfo, StageWidget
 
         info = StageInfo(name="stt", label="STT", status="active")
         widget = StageWidget(info)
         label = widget._format_label()
-        assert "\u25c9" in label  # active icon
+        # active state renders one of the rotating spinner frames so the
+        # user can see at a glance the stage is alive.
+        assert any(frame in label for frame in _SPINNER_FRAMES)
+        assert "STT" in label
 
 
 class TestModelStatusFormat:

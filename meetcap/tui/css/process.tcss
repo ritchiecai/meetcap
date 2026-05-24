@@ -4,6 +4,15 @@
     overflow-y: auto;
 }
 
+#process-status-banner {
+    height: 1;
+    margin: 0 0 1 0;
+    padding: 0 1;
+    background: $boost;
+    border: none;
+    text-align: center;
+}
+
 #pipeline-progress {
     height: auto;
     margin: 1 0;
