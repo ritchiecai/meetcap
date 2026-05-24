@@ -1,14 +1,22 @@
 """comprehensive tests for summarization service"""
 
+import io
+import json as _json
 import tempfile
 import threading
+import urllib.error
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
 
-from meetcap.services.summarization import SummarizationService, extract_meeting_title, save_summary
+from meetcap.services.summarization import (
+    OmlxSummarizationService,
+    SummarizationService,
+    extract_meeting_title,
+    save_summary,
+)
 
 
 class TestSummarizationService:
@@ -745,3 +753,259 @@ class MockSummarizationService:
                 )
 
         return base_summary
+
+
+# ---------------------------------------------------------------------------
+# OmlxSummarizationService tests
+# ---------------------------------------------------------------------------
+
+
+def _fake_urlopen_factory(payload: dict, status: int = 200):
+    """build a fake urlopen context manager that returns a JSON payload."""
+
+    class _FakeResp:
+        def __init__(self, data: bytes, status: int):
+            self._data = data
+            self.status = status
+
+        def read(self) -> bytes:
+            return self._data
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    body = _json.dumps(payload).encode("utf-8")
+
+    def _fake_urlopen(req, timeout=None):
+        return _FakeResp(body, status)
+
+    return _fake_urlopen
+
+
+class TestOmlxSummarizationServiceCallOmlx:
+    """unit tests for OmlxSummarizationService._call_omlx response handling.
+
+    these tests exist to defend against the regression we found in 2026-05-24:
+    when oMLX returns the answer in `reasoning_content` instead of `content`,
+    or when the response is malformed, the previous implementation crashed
+    with KeyError or fed `None` into post-processing — silently producing
+    truncated/empty summaries. these tests pin down the new defensive paths.
+    """
+
+    def _make(self, **overrides):
+        kwargs = dict(
+            model_name="mlx-community/Qwen3.5-2B-OptiQ-4bit",
+            base_url="http://localhost:8000/v1",
+            temperature=0.4,
+            max_tokens=4096,
+            timeout=10,
+        )
+        kwargs.update(overrides)
+        return OmlxSummarizationService(**kwargs)
+
+    def test_normal_content_path(self):
+        """happy path: server returns content, output is stripped and returned."""
+        svc = self._make()
+        payload = {
+            "choices": [
+                {
+                    "message": {"content": "## summary\n\nhello world\n"},
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+        with patch(
+            "meetcap.services.summarization.urllib.request.urlopen",
+            side_effect=_fake_urlopen_factory(payload),
+        ):
+            out = svc._call_omlx("system", "user")
+        assert "hello world" in out
+        # _strip_untagged_thinking shouldn't truncate a clean ## heading
+        assert out.startswith("## summary")
+
+    def test_reasoning_content_fallback(self):
+        """if content is empty but reasoning_content has text, use it."""
+        svc = self._make()
+        payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "reasoning_content": "## summary\n\nfallback text",
+                    },
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+        with patch(
+            "meetcap.services.summarization.urllib.request.urlopen",
+            side_effect=_fake_urlopen_factory(payload),
+        ):
+            out = svc._call_omlx("system", "user")
+        assert "fallback text" in out
+
+    def test_reasoning_content_fallback_when_content_is_null(self):
+        """content=None should also trigger reasoning_content fallback."""
+        svc = self._make()
+        payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": None,
+                        "reasoning_content": "## summary\n\nrecovered",
+                    },
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+        with patch(
+            "meetcap.services.summarization.urllib.request.urlopen",
+            side_effect=_fake_urlopen_factory(payload),
+        ):
+            out = svc._call_omlx("system", "user")
+        assert "recovered" in out
+
+    def test_choices_missing_raises(self):
+        """malformed payload with no choices should raise loudly."""
+        svc = self._make()
+        payload = {"id": "abc", "object": "chat.completion"}
+        with patch(
+            "meetcap.services.summarization.urllib.request.urlopen",
+            side_effect=_fake_urlopen_factory(payload),
+        ):
+            with pytest.raises(RuntimeError, match="no choices"):
+                svc._call_omlx("system", "user")
+
+    def test_empty_choices_list_raises(self):
+        """choices=[] should also raise."""
+        svc = self._make()
+        payload = {"choices": []}
+        with patch(
+            "meetcap.services.summarization.urllib.request.urlopen",
+            side_effect=_fake_urlopen_factory(payload),
+        ):
+            with pytest.raises(RuntimeError, match="no choices"):
+                svc._call_omlx("system", "user")
+
+    def test_both_content_and_reasoning_empty_raises(self):
+        """if neither content nor reasoning_content has text, raise."""
+        svc = self._make()
+        payload = {
+            "choices": [
+                {
+                    "message": {"content": "", "reasoning_content": ""},
+                    "finish_reason": "length",
+                }
+            ]
+        }
+        with patch(
+            "meetcap.services.summarization.urllib.request.urlopen",
+            side_effect=_fake_urlopen_factory(payload),
+        ):
+            with pytest.raises(RuntimeError, match="empty content"):
+                svc._call_omlx("system", "user")
+
+    def test_thinking_tags_are_stripped(self):
+        """<think>...</think> blocks should be removed from the output."""
+        svc = self._make()
+        payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            "<think>let me reason about this</think>\n"
+                            "## summary\n\nclean output"
+                        )
+                    },
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+        with patch(
+            "meetcap.services.summarization.urllib.request.urlopen",
+            side_effect=_fake_urlopen_factory(payload),
+        ):
+            out = svc._call_omlx("system", "user")
+        assert "<think>" not in out.lower()
+        assert "## summary" in out
+
+    def test_payload_contains_defensive_fields(self):
+        """payload sent to oMLX must include top_p and stop tokens (regression
+        guard for the 2026-05-24 hardening)."""
+        svc = self._make()
+        payload = {
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
+        }
+        captured = {}
+
+        def _capture_urlopen(req, timeout=None):
+            captured["data"] = _json.loads(req.data.decode("utf-8"))
+            captured["timeout"] = timeout
+
+            class _R:
+                status = 200
+
+                def read(self):
+                    return _json.dumps(payload).encode("utf-8")
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return False
+
+            return _R()
+
+        with patch(
+            "meetcap.services.summarization.urllib.request.urlopen",
+            side_effect=_capture_urlopen,
+        ):
+            svc._call_omlx("system", "user")
+
+        body = captured["data"]
+        assert body["model"] == "mlx-community/Qwen3.5-2B-OptiQ-4bit"
+        assert body["temperature"] == pytest.approx(0.4)
+        assert body["max_tokens"] == 4096
+        assert body["stream"] is False
+        assert body["top_p"] == pytest.approx(0.95)
+        assert "<|im_end|>" in body["stop"]
+        assert "<|endoftext|>" in body["stop"]
+        assert body["chat_template_kwargs"] == {"enable_thinking": False}
+        assert captured["timeout"] == 10
+
+    def test_http_error_is_wrapped(self):
+        """HTTPError should surface as a RuntimeError with status code."""
+        svc = self._make()
+
+        def _raise(req, timeout=None):
+            raise urllib.error.HTTPError(
+                url="http://localhost:8000/v1/chat/completions",
+                code=500,
+                msg="Internal Server Error",
+                hdrs=None,
+                fp=io.BytesIO(b'{"error": "boom"}'),
+            )
+
+        with patch(
+            "meetcap.services.summarization.urllib.request.urlopen",
+            side_effect=_raise,
+        ):
+            with pytest.raises(RuntimeError, match="oMLX API error 500"):
+                svc._call_omlx("system", "user")
+
+    def test_url_error_is_wrapped(self):
+        """URLError (connection refused etc.) should surface as ConnectionError."""
+        svc = self._make()
+
+        def _raise(req, timeout=None):
+            raise urllib.error.URLError("connection refused")
+
+        with patch(
+            "meetcap.services.summarization.urllib.request.urlopen",
+            side_effect=_raise,
+        ):
+            with pytest.raises(ConnectionError, match="cannot connect to oMLX"):
+                svc._call_omlx("system", "user")

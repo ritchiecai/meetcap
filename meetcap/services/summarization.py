@@ -452,8 +452,12 @@ class OmlxSummarizationService:
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": self.temperature,
+            "top_p": 0.95,
             "max_tokens": self.max_tokens,
             "stream": False,
+            # tokens that should hard-stop generation (defensive against
+            # chat-template token leaks from server-side rendering)
+            "stop": ["<|im_end|>", "<|endoftext|>"],
             "chat_template_kwargs": {"enable_thinking": self.enable_thinking},
         }
 
@@ -485,7 +489,34 @@ class OmlxSummarizationService:
                 f"cannot connect to oMLX at {self.base_url}: {e.reason}"
             ) from e
 
-        raw_output = result["choices"][0]["message"]["content"].strip()
+        # defensive response parsing: oMLX (and OpenAI-compatible servers in
+        # general) may put the actual answer in `reasoning_content` instead of
+        # `content` when the model emits thinking tokens, or return malformed
+        # payloads under high load. fail loudly with diagnostic info instead
+        # of silently feeding `None` into the post-processing pipeline.
+        choices = result.get("choices") or []
+        if not choices:
+            raise RuntimeError(
+                f"oMLX returned no choices; raw response keys={list(result.keys())}"
+            )
+        message = choices[0].get("message") or {}
+        content = message.get("content")
+        if not content:
+            # fall back to reasoning_content if the server split the output
+            reasoning = message.get("reasoning_content")
+            if reasoning:
+                console.print(
+                    "[dim]oMLX returned empty content; using reasoning_content[/dim]"
+                )
+                content = reasoning
+        if not content:
+            raise RuntimeError(
+                "oMLX returned empty content; "
+                f"message keys={list(message.keys())}, "
+                f"finish_reason={choices[0].get('finish_reason')!r}"
+            )
+
+        raw_output = content.strip()
 
         # always clean thinking tags — models may output them regardless of enable_thinking
         if "<think" in raw_output.lower() or "</think" in raw_output.lower():
