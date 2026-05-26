@@ -78,6 +78,21 @@ class TestSherpaOnnxDiarizationService:
         assert service.threshold == 0.90
         assert service.min_duration_on == 0.3
         assert service.min_duration_off == 0.5
+        # apple silicon defaults: cpu provider, 4 intra-op threads.
+        # see services/diarization.py for measurement-based rationale.
+        assert service.provider == "cpu"
+        assert service.num_threads == 4
+
+    def test_init_custom_provider_and_threads(self):
+        """provider/num_threads can be overridden (e.g. coreml on x86)"""
+        service = SherpaOnnxDiarizationService(
+            segmentation_model="/seg.onnx",
+            embedding_model="/emb.onnx",
+            provider="coreml",
+            num_threads=8,
+        )
+        assert service.provider == "coreml"
+        assert service.num_threads == 8
 
     def test_load_model_import_error(self):
         """test handling import error when sherpa-onnx not installed"""
@@ -154,6 +169,38 @@ class TestSherpaOnnxDiarizationService:
             service.load_model()
 
         assert service.sd is mock_sd
+
+    def test_load_model_passes_provider_and_threads(self, tmp_path):
+        """provider/num_threads must be forwarded to both sherpa-onnx
+        sub-config classes (segmentation + embedding). regression guard
+        for the 2026-05-25 perf fix."""
+        seg_path = tmp_path / "seg.onnx"
+        seg_path.write_bytes(b"fake")
+        emb_path = tmp_path / "emb.onnx"
+        emb_path.write_bytes(b"fake")
+
+        service = SherpaOnnxDiarizationService(
+            segmentation_model=str(seg_path),
+            embedding_model=str(emb_path),
+            provider="coreml",
+            num_threads=2,
+        )
+
+        mock_sherpa = Mock()
+        mock_config = Mock()
+        mock_config.validate.return_value = True
+        mock_sherpa.OfflineSpeakerDiarizationConfig.return_value = mock_config
+        mock_sherpa.OfflineSpeakerDiarization.return_value = Mock()
+
+        with patch.dict("sys.modules", {"sherpa_onnx": mock_sherpa}):
+            service.load_model()
+
+        seg_kwargs = mock_sherpa.OfflineSpeakerSegmentationModelConfig.call_args.kwargs
+        emb_kwargs = mock_sherpa.SpeakerEmbeddingExtractorConfig.call_args.kwargs
+        assert seg_kwargs.get("provider") == "coreml"
+        assert seg_kwargs.get("num_threads") == 2
+        assert emb_kwargs.get("provider") == "coreml"
+        assert emb_kwargs.get("num_threads") == 2
 
     def test_load_model_idempotent(self, tmp_path):
         """test that loading twice doesn't reload"""

@@ -59,6 +59,16 @@ class Config:
             "diarization_backend": "sherpa",  # diarization backend: sherpa or vosk
             "sherpa_num_speakers": -1,  # expected speaker count (-1 for auto)
             "sherpa_cluster_threshold": 0.90,  # clustering threshold (higher = fewer speakers)
+            # onnxruntime execution provider for sherpa-onnx (segmentation + embedding).
+            # "cpu" or "coreml". apple silicon m-series: keep "cpu" — embedding is called
+            # on many short (~1-5s) chunks where ANE launch/copy cost dominates and
+            # coreml is empirically slower than cpu+threads. measured on M4/79min:
+            # cpu/4-threads 644s vs full-coreml 1162s.
+            "sherpa_provider": "cpu",
+            # onnxruntime intra-op threads for sherpa-onnx. apple silicon: set to
+            # P-core count (M4=4, M3 Pro=6). values above P-core count usually hurt
+            # due to e-core contention.
+            "sherpa_num_threads": 4,
             "llm_model_name": "mlx-community/Qwen3.5-2B-OptiQ-4bit",  # mlx llm model repo id
         },
         "paths": {
@@ -152,6 +162,8 @@ class Config:
             "MEETCAP_DIARIZATION_BACKEND": ("models", "diarization_backend"),
             "MEETCAP_SHERPA_NUM_SPEAKERS": ("models", "sherpa_num_speakers", int),
             "MEETCAP_SHERPA_THRESHOLD": ("models", "sherpa_cluster_threshold", float),
+            "MEETCAP_SHERPA_PROVIDER": ("models", "sherpa_provider"),
+            "MEETCAP_SHERPA_NUM_THREADS": ("models", "sherpa_num_threads", int),
             "MEETCAP_LLM_MODEL": ("models", "llm_model_name"),
             "MEETCAP_OUT_DIR": ("paths", "out_dir"),
             # memory management settings

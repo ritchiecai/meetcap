@@ -567,12 +567,24 @@ class ProcessScreen(Screen):
                     "models", "sherpa_cluster_threshold", 0.90
                 )
             )
+            provider = str(
+                config.get(  # type: ignore[union-attr]
+                    "models", "sherpa_provider", "cpu"
+                )
+            )
+            num_threads = int(
+                config.get(  # type: ignore[union-attr]
+                    "models", "sherpa_num_threads", 4
+                )
+            )
 
             diar_service = SherpaOnnxDiarizationService(
                 segmentation_model=seg_model,
                 embedding_model=emb_model,
                 num_speakers=num_speakers,
                 threshold=threshold,
+                provider=provider,
+                num_threads=num_threads,
             )
             diar_segments = diar_service.diarize(audio_path)
             result.segments, result.speakers = assign_speakers(  # type: ignore[union-attr]

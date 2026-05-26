@@ -66,6 +66,8 @@ class SherpaOnnxDiarizationService(DiarizationService):
         threshold: float = DEFAULT_CLUSTER_THRESHOLD,
         min_duration_on: float = 0.3,
         min_duration_off: float = 0.5,
+        provider: str = "cpu",
+        num_threads: int = 4,
     ):
         """
         initialize sherpa-onnx diarization service.
@@ -77,6 +79,17 @@ class SherpaOnnxDiarizationService(DiarizationService):
             threshold: clustering threshold (higher = fewer speakers)
             min_duration_on: minimum speech segment duration in seconds
             min_duration_off: minimum silence duration in seconds
+            provider: onnxruntime execution provider for both segmentation
+                and embedding ("cpu" or "coreml"). on apple silicon,
+                empirically "cpu" + num_threads=4 outperforms coreml because
+                embedding is invoked on many tiny (1~5s) chunks where ANE
+                launch/copy overhead dominates. keep default "cpu" unless
+                a specific deployment proves coreml is faster.
+            num_threads: onnxruntime intra-op thread count for both
+                segmentation and embedding. apple silicon m-series tops out
+                at the number of performance cores (e.g., 4 on M4). values
+                higher than P-core count usually hurt due to e-core
+                contention.
         """
         self.segmentation_model = segmentation_model
         self.embedding_model = embedding_model
@@ -84,6 +97,8 @@ class SherpaOnnxDiarizationService(DiarizationService):
         self.threshold = threshold
         self.min_duration_on = min_duration_on
         self.min_duration_off = min_duration_off
+        self.provider = provider
+        self.num_threads = num_threads
         self.sd = None
 
     def load_model(self) -> None:
@@ -117,9 +132,13 @@ class SherpaOnnxDiarizationService(DiarizationService):
                 pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(
                     model=self.segmentation_model,
                 ),
+                provider=self.provider,
+                num_threads=self.num_threads,
             ),
             embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(
                 model=self.embedding_model,
+                provider=self.provider,
+                num_threads=self.num_threads,
             ),
             clustering=sherpa_onnx.FastClusteringConfig(
                 num_clusters=self.num_speakers,

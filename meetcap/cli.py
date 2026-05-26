@@ -821,12 +821,16 @@ class RecordingOrchestrator:
                     )
                     num_speakers = self.config.get("models", "sherpa_num_speakers", -1)
                     threshold = self.config.get("models", "sherpa_cluster_threshold", 0.90)
+                    provider = self.config.get("models", "sherpa_provider", "cpu")
+                    num_threads = self.config.get("models", "sherpa_num_threads", 4)
 
                     diar_service = SherpaOnnxDiarizationService(
                         segmentation_model=seg_model,
                         embedding_model=emb_model,
                         num_speakers=int(num_speakers),
                         threshold=float(threshold),
+                        provider=str(provider),
+                        num_threads=int(num_threads),
                     )
                     diar_segments = diar_service.diarize(audio_file)
                     transcript_result.segments, transcript_result.speakers = assign_speakers(
